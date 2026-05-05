@@ -1,4 +1,5 @@
 #!/bin/bash
+#SBATCH --account=${SBATCH_ACCOUNT}
 #SBATCH --job-name=gipfel-infra
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
