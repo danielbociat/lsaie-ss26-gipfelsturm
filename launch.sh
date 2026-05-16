@@ -33,6 +33,10 @@ case $MODE in
         LR_WARMUP_ITERS=10
         LOGGING_EXTRA=""
         WANDB=true
+
+        CKPT_ENABLED=false
+        SAVE_INTERVAL=0
+        MAX_RESTARTS=0
         ;;
     train)
         TRAINING_STEPS=${3:?Usage: ./launch.sh train <model_size> <steps> [nodes]}
@@ -46,10 +50,10 @@ case $MODE in
     --log-timers-to-tensorboard
     --log-memory-to-tensorboard"
         WANDB=true
-        ;;
-    *)
-        echo "Unknown mode: $MODE. Choose: throughput, train"
-        exit 1
+
+        SAVE_INTERVAL=${SAVE_INTERVAL:-500}
+        MAX_RESTARTS=${MAX_RESTARTS:-3}
+        CKPT_ENABLED=true
         ;;
 esac
 
@@ -93,24 +97,29 @@ JOB_NAME="gipfel-${MODE}-${MODEL_SIZE}-${TRAINING_STEPS}s-${NODES}n"
 if [ "$WANDB" = true ]; then
     WANDB_BLOCK='
 # WANDB
-if [ -n "$WANDB_API_KEY" ]; then
+WANDB_ARGS=()
+if [ -n "${WANDB_API_KEY:-}" ]; then
     echo "[$(date)] WANDB enabled."
-    TRAINING_CMD="$TRAINING_CMD \
-        --wandb-save-dir $LOG_DIR \
-        --wandb-project $PROJECT_NAME \
-        --wandb-exp-name $EXP_NAME-$SLURM_JOB_ID"
+    WANDB_ARGS+=(
+        --wandb-save-dir "$LOG_DIR"
+        --wandb-project "$PROJECT_NAME"
+        --wandb-exp-name "$EXP_NAME-$SLURM_JOB_ID"
+    )
 else
     export WANDB_MODE=disabled
     echo "[$(date)] WANDB disabled."
 fi'
 else
-    WANDB_BLOCK='export WANDB_MODE=disabled'
+    WANDB_BLOCK='
+WANDB_ARGS=()
+export WANDB_MODE=disabled'
 fi
 
 ################ Generate script ################
 mkdir -p logs
 
 SCRIPT="logs/${JOB_NAME}.sbatch"
+
 
 cat > "$SCRIPT" << 'HEADER'
 #!/bin/bash
@@ -127,7 +136,7 @@ cat >> "$SCRIPT" << SBATCH_DIRECTIVES
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=288
 #SBATCH --mem=460000
-#SBATCH --no-requeue
+#SBATCH --requeue
 SBATCH_DIRECTIVES
 
 cat >> "$SCRIPT" << 'BODY_HEAD'
@@ -157,13 +166,21 @@ PROJECT_NAME=gipfelsturm
 EXP_NAME=${MODE}-${MODEL_SIZE}-\${SLURM_NNODES}n
 LOG_DIR=/iopsstor/scratch/cscs/\$USER/gipfelsturm/\$PROJECT_NAME/\$EXP_NAME
 TENSORBOARD_DIR=\$LOG_DIR/tensorboard
+
+CKPT_ENABLED=${CKPT_ENABLED}
+SAVE_INTERVAL=${SAVE_INTERVAL}
+MAX_RESTARTS=${MAX_RESTARTS}
+
+CHECKPOINT_ROOT=/iopsstor/scratch/cscs/\$USER/gipfelsturm/checkpoints
+CHECKPOINT_DIR=\$CHECKPOINT_ROOT/\$EXP_NAME
+
 CONFIGS
 
 cat >> "$SCRIPT" << 'SETUP'
 
 #########################################
 
-mkdir -p logs $LOG_DIR $TENSORBOARD_DIR $DATASET_CACHE_DIR
+mkdir -p logs $LOG_DIR $TENSORBOARD_DIR $DATASET_CACHE_DIR $CHECKPOINT_DIR
 
 cd $MEGATRON_LM_DIR
 flock $MEGATRON_LM_DIR/.git-lock bash -c "cd $MEGATRON_LM_DIR && git checkout -- . && git apply $WORKDIR/patches/*.patch"
@@ -219,6 +236,7 @@ TRAINING_ARGS=(
     --manual-gc
     --manual-gc-interval 50
 )
+
 
 REGULARIZATION_ARGS=(
     --attention-dropout 0.0
@@ -280,6 +298,85 @@ DATA_ARGS=(
     --num-workers 1
 )
 
+checkpoint_dir_for_iter() {
+    local iter="$1"
+    printf "%s/iter_%07d" "$CHECKPOINT_DIR" "$iter"
+}
+
+checkpoint_dir_looks_complete() {
+    local dir="$1"
+
+    [[ -d "$dir" ]] || return 1
+
+
+    find "$dir" -type f \( \
+        -name "metadata.json" -o \
+        -name "common.pt" -o \
+        -name "*.distcp" -o \
+        -name "model_optim_rng.pt" -o \
+        -name "model_rng.pt" \
+    \) | grep -q .
+}
+
+repair_latest_checkpoint_tracker() {
+    [[ "$CKPT_ENABLED" == "true" ]] || return 1
+    [[ -d "$CHECKPOINT_DIR" ]] || return 1
+
+    local tracker="$CHECKPOINT_DIR/latest_checkpointed_iteration.txt"
+
+    local dirs
+    mapfile -t dirs < <(find "$CHECKPOINT_DIR" -maxdepth 1 -type d -name "iter_*" | sort -V -r)
+
+    for dir in "${dirs[@]}"; do
+        if checkpoint_dir_looks_complete "$dir"; then
+            local base
+            base=$(basename "$dir")
+            local iter="${base#iter_}"
+
+            # Convert 0000500 -> 500 safely.
+            iter=$((10#$iter))
+
+            echo "$iter" > "$tracker.tmp"
+            mv "$tracker.tmp" "$tracker"
+            echo "[$(date)] Latest usable checkpoint: iteration $iter"
+            return 0
+        fi
+    done
+
+    echo "[$(date)] No usable checkpoint found in $CHECKPOINT_DIR"
+    return 1
+}
+
+build_checkpoint_args() {
+    CHECKPOINT_ARGS=()
+
+    if [[ "$CKPT_ENABLED" != "true" ]]; then
+        return 0
+    fi
+
+    CHECKPOINT_ARGS+=(
+        --save "$CHECKPOINT_DIR"
+        --save-interval "$SAVE_INTERVAL"
+        --ckpt-format torch_dist
+
+        # Important mitigation for the segfault issue:
+        # avoid the fully parallel save path initially.
+        --no-ckpt-fully-parallel-save
+    )
+
+
+    if repair_latest_checkpoint_tracker; then
+        CHECKPOINT_ARGS+=(
+            --load "$CHECKPOINT_DIR"
+            --exit-on-missing-checkpoint
+        )
+    else
+        echo "[$(date)] Starting without --load because no valid checkpoint exists."
+    fi
+}
+
+
+
 TORCHRUN_ARGS=(
     --nproc-per-node $SLURM_GPUS_PER_NODE
     --nnodes $SLURM_NNODES
@@ -289,19 +386,31 @@ TORCHRUN_ARGS=(
     --tee 3
 )
 
-TRAINING_CMD="torchrun ${TORCHRUN_ARGS[@]} $MEGATRON_LM_DIR/pretrain_gpt.py \
-    ${TRANSFORMER_ENGINE_ARGS[@]} \
-    ${NETWORK_SIZE_ARGS[@]} \
-    ${TRAINING_ARGS[@]} \
-    ${REGULARIZATION_ARGS[@]} \
-    ${LEARNING_RATE_ARGS[@]} \
-    ${INITIALIZATION_ARGS[@]} \
-    ${MIXED_PRECISION_ARGS[@]} \
-    ${DISTRIBUTED_ARGS[@]} \
-    ${LOGGING_ARGS[@]} \
-    ${TOKENIZER_ARGS[@]} \
-    ${DATA_ARGS[@]}"
+build_training_cmd() {
+    build_checkpoint_args
 
+    TRAINING_CMD_ARRAY=(
+        torchrun
+        "${TORCHRUN_ARGS[@]}"
+        "$MEGATRON_LM_DIR/pretrain_gpt.py"
+
+        "${TRANSFORMER_ENGINE_ARGS[@]}"
+        "${NETWORK_SIZE_ARGS[@]}"
+        "${TRAINING_ARGS[@]}"
+        "${REGULARIZATION_ARGS[@]}"
+        "${LEARNING_RATE_ARGS[@]}"
+        "${INITIALIZATION_ARGS[@]}"
+        "${MIXED_PRECISION_ARGS[@]}"
+        "${DISTRIBUTED_ARGS[@]}"
+        "${LOGGING_ARGS[@]}"
+        "${TOKENIZER_ARGS[@]}"
+        "${DATA_ARGS[@]}"
+        "${CHECKPOINT_ARGS[@]}"
+        "${WANDB_ARGS[@]}"
+    )
+
+    printf -v TRAINING_CMD "%q " "${TRAINING_CMD_ARRAY[@]}"
+}
 TOKENIZER
 
 cat >> "$SCRIPT" << 'WANDB_PLACEHOLDER'
@@ -315,8 +424,47 @@ WANDB_INSERT
 
 cat >> "$SCRIPT" << 'FOOTER'
 
-echo "CMD: $TRAINING_CMD"
-srun -lu --mpi=pmix --network=disable_rdzv_get --environment=alps3 --cpus-per-task $SLURM_CPUS_PER_TASK --wait 60 bash -c "numactl --membind=0-3 $TRAINING_CMD"
+ATTEMPT=0
+
+while true; do
+    build_training_cmd
+
+    echo "[$(date)] CMD: $TRAINING_CMD"
+
+    set +e
+    srun -lu \
+        --mpi=pmix \
+        --network=disable_rdzv_get \
+        --environment=alps3 \
+        --cpus-per-task "$SLURM_CPUS_PER_TASK" \
+        --wait 60 \
+        bash -lc "numactl --membind=0-3 $TRAINING_CMD"
+
+    EXIT_CODE=$?
+    set -e
+
+    if [[ "$EXIT_CODE" -eq 0 ]]; then
+        echo "[$(date)] Training exited cleanly."
+        break
+    fi
+
+    ATTEMPT=$((ATTEMPT + 1))
+
+    echo "[$(date)] Training failed with exit code $EXIT_CODE."
+    echo "[$(date)] Restart attempt $ATTEMPT / $MAX_RESTARTS."
+
+    if [[ "$ATTEMPT" -gt "$MAX_RESTARTS" ]]; then
+        echo "[$(date)] Too many failures. Exiting."
+        exit "$EXIT_CODE"
+    fi
+
+    # Re-check checkpoint state before retrying.
+    if [[ "$CKPT_ENABLED" == "true" ]]; then
+        repair_latest_checkpoint_tracker || true
+    fi
+
+    sleep 30
+done
 
 echo "END TIME: $(date)"
 FOOTER
@@ -324,4 +472,12 @@ FOOTER
 chmod +x "$SCRIPT"
 
 echo "Generated: $SCRIPT"
+
+if [[ "${NO_SUBMIT:-0}" == "1" ]]; then
+    echo "NO_SUBMIT=1 set, not submitting."
+    bash -n "$SCRIPT"
+    echo "Syntax check passed: $SCRIPT"
+    exit 0
+fi
+
 sbatch "$SCRIPT"
